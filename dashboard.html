@@ -5440,6 +5440,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+            <h2 style="margin:0">429 限流处理方式 <em id="setThrottle429State"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              上游返回 429 时怎么处理。<b>冷却</b>（默认，原机制）：把该账号的这个模型冻结一段时间——上游给了重置时刻就冻到那时，没给就按阶梯（60 秒起、封顶 10 分钟）冻结，期间不再尝试上游，直接本地回 429。<b>直通</b>（workbuddy2api 机制）：照旧把 429 返回给客户端并带上 Retry-After，但不冻结账号，下一次请求立刻重试上游。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              注意：直通只作用于「频率限流」这一条路径。上游判定额度用满（code 6004，仅免费模型）仍按重置时刻停用，账号级熔断也不受影响。直通会把 429 原文透传出去，需要客户端自己重试。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setThrottle429" type="checkbox" style="width:16px;height:16px">
+              直通（不冻结账号）
+            </label>
+            <button onclick="saveThrottle429(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
             <h2 style="margin:0">模型额度定时主动查询 <em id="setQuotaScanState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               勾选要留意的模型后，网关每 6 小时为每个「账号 + 模型」发一个最小请求，主动确认这条配额线是否已经被打满：打到 429 就立即记该模型的冷却，并把上游给的重置时刻交给上面的「模型额度窗口探针」到点处理；请求通了就说明这条线还没到限额。窗口探针管的是「已经限额之后」，这里管的是「还没限额时先知道」。默认不勾选，勾选后才会定时查询。
@@ -11871,6 +11892,14 @@ async function loadSettings(showToast){
         egressBackoffState.textContent = egressBackoff ? '(已启用)' : '(未启用)';
         egressBackoffState.style.color = egressBackoff ? 'var(--accent2)' : 'var(--dim)';
       }
+      const throttle429 = data.throttle_429 === 'passthrough';
+      const throttle429Input = document.getElementById('setThrottle429');
+      if(throttle429Input) throttle429Input.checked = throttle429;
+      const throttle429State = document.getElementById('setThrottle429State');
+      if(throttle429State){
+        throttle429State.textContent = throttle429 ? '(直通 / 2api 机制)' : '(冷却 / 原机制)';
+        throttle429State.style.color = throttle429 ? 'var(--accent2)' : 'var(--dim)';
+      }
       const accountConcurrent = (typeof data.account_max_concurrent === 'number') ? data.account_max_concurrent : 0;
       const accountConcurrentInput = document.getElementById('setAccountConcurrent');
       if(accountConcurrentInput) accountConcurrentInput.value = accountConcurrent;
@@ -13067,6 +13096,23 @@ async function saveAccountConcurrent(btn){
   try {
     await postJSON('/settings/save', {account_max_concurrent: value});
     toast(value > 0 ? ('已保存：每个账号同时最多 ' + value + ' 个请求') : '已保存：账号并发不限', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveThrottle429(btn){
+  const el = document.getElementById('setThrottle429');
+  const value = (el && el.checked) ? 'passthrough' : 'cooldown';
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {throttle_429: value});
+    toast(value === 'passthrough'
+      ? '已切换为直通：429 不再冻结账号，下一次请求立刻重试上游'
+      : '已切换为冷却：429 后冻结该账号的这个模型（原机制）', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');

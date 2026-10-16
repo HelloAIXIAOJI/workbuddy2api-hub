@@ -1788,6 +1788,45 @@ def set_models_only_available(accounts_dir, enabled):
     return enabled
 
 
+#: 429 的两种处置。集中在这里，读写与面板校验共用一处定义，避免字面量散落。
+THROTTLE_429_MODES = ("cooldown", "passthrough")
+THROTTLE_429_DEFAULT = "cooldown"
+
+
+def throttle_429(accounts_dir):
+    """How an upstream 429 is turned into a cooldown.
+
+    "cooldown" (default) is the behaviour that predates the switch: the
+    account's window for that model is parked for the reset instant the
+    upstream named, or for the window the caller computed when the body names
+    none.
+
+    "passthrough" is the workbuddy2api behaviour: the 429 is still reported to
+    the client with its Retry-After, but no frequency cooldown is recorded, so
+    the next request goes upstream again. An agent that issues a tool call
+    every few seconds recovers on its own instead of being answered from a
+    local window the upstream never asked for.
+
+    The default stays "cooldown" because an install that predates the setting
+    must keep behaving exactly as it did, and because passthrough shifts the
+    retry onto the client. Any value that is not exactly "passthrough" reads as
+    "cooldown", so a hand-edited settings file cannot silently disable
+    throttling.
+    """
+    value = load(accounts_dir).get("throttle_429")
+    return "passthrough" if value == "passthrough" else THROTTLE_429_DEFAULT
+
+
+def set_throttle_429(accounts_dir, mode):
+    """Persist the 429 handling mode. Returns the stored value."""
+    mode = mode if mode in THROTTLE_429_MODES else THROTTLE_429_DEFAULT
+    with _lock:
+        data = load(accounts_dir)
+        data["throttle_429"] = mode
+        save(accounts_dir, data)
+    return mode
+
+
 def auto_switch_product(accounts_dir):
     """Whether an upstream 429 may rotate an account's outbound identity.
 

@@ -10207,6 +10207,7 @@ def runtime_settings_view():
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
+        "throttle_429": wb_settings.throttle_429(ACCOUNTS_DIR),
         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
         "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
@@ -13891,6 +13892,16 @@ def auto_switch_product_enabled():
     return wb_settings.auto_switch_product(ACCOUNTS_DIR)
 
 
+def throttle_429_mode():
+    """The panel's 429 handling mode.
+
+    "cooldown" parks the account's window for that model; "passthrough" relays
+    the 429 and keeps the account in rotation. See wb_settings.throttle_429 for
+    why the default is cooldown.
+    """
+    return wb_settings.throttle_429(ACCOUNTS_DIR)
+
+
 def _switch_count(account, model):
     """这一轮已经切过几次（60 秒内的切换算同一轮）。"""
     entry = _SWITCH_LOG.get((account.uid, model))
@@ -14421,6 +14432,31 @@ def parse_rate_limit_reset(detail):
         return None
 
 
+#: Passthrough 模式下上游没给重试提示时报给客户端的秒数。它不是网关自定的窗口，
+#: 只是「别立刻重试」的下限；真正的重试节奏由客户端决定（2api 正是这么做的）。
+PASSTHROUGH_RETRY_AFTER = 5
+
+
+def parse_retry_after_detail(detail):
+    """Pull a wait in seconds out of a 429 body, or None when it names none.
+
+    The upstream has two ways of saying "later": an absolute reset wall clock
+    (code 6004, handled by parse_rate_limit_reset) and a plain "retry in 51s".
+    Only the passthrough path consults this. Tolerant on purpose: an
+    unparseable body must not break the request path.
+    """
+    if not detail:
+        return None
+    m = re.search(r"retry(?:ing)?\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*s\b",
+                  detail, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return max(1, int(float(m.group(1))))
+    except (TypeError, ValueError):
+        return None
+
+
 def upstream_timeouts():
     """(header, idle) seconds for the chat upstream socket.
 
@@ -14638,6 +14674,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # settings read on every retry would be pure overhead.
     auto_switch = (auto_switch_product_enabled()
                    if allow_product_switch and pinned is None else False)
+    # Panel setting, same treatment. cooldown parks this account's window for
+    # this model; passthrough relays the 429 and keeps the account in rotation.
+    park_on_429 = throttle_429_mode() != "passthrough"
     # Panel parity: header/idle timeouts are read once per request, not
     # once per retry, so a settings read never lands in the retry loop.
     header_timeout, idle_timeout = upstream_timeouts()
@@ -14830,10 +14869,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     detail = ""
                 reset_at = parse_rate_limit_reset(detail)
                 if rate_limit_is_account_level(detail, reset_at):
-                    wait = account.note_soft_rate("HTTP 429 (account soft rate)")
-                    log("account %s soft-rate limited (%r), cooling %.0fs (streak %d)"
-                        % (account.uid[:8], credential_scope_phrase(detail), wait,
-                           account.soft_streak))
+                    if park_on_429:
+                        wait = account.note_soft_rate("HTTP 429 (account soft rate)")
+                        log("account %s soft-rate limited (%r), cooling %.0fs (streak %d)"
+                            % (account.uid[:8], credential_scope_phrase(detail), wait,
+                               account.soft_streak))
+                    else:
+                        account.note_rate_observed(
+                            "HTTP 429 (account soft rate, passthrough)", detail)
+                        log("account %s soft-rate limited (%r), passthrough: not parked"
+                            % (account.uid[:8], credential_scope_phrase(detail)))
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
                     last_error = exc
@@ -14846,16 +14891,30 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # model and grows on the short ladder (60s up to 10m) instead of
                 # the credential's 600s -> 2h one. An unrecognised body gets the
                 # same 60s on one model, with no streak at all.
-                wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
-                if reset_at is None and rate_limit_is_soft_shape(detail):
-                    wait = account.note_unscoped_rate(model)
-                    log("account %s: unscoped 429, parking '%s' for %.0fs "
-                        "(unscoped streak %d)"
-                        % (account.uid[:8], model, wait, account.unscoped_streak))
                 # Model-scoped: only this model is throttled for this account,
                 # so sibling models stay serviceable on the same credential.
-                account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
-                                   cooldown=wait, detail=detail)
+                if park_on_429:
+                    wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
+                    if reset_at is None and rate_limit_is_soft_shape(detail):
+                        wait = account.note_unscoped_rate(model)
+                        log("account %s: unscoped 429, parking '%s' for %.0fs "
+                            "(unscoped streak %d)"
+                            % (account.uid[:8], model, wait, account.unscoped_streak))
+                    account.note_error("HTTP 429 (model throttled)", model=model,
+                                       until=reset_at, cooldown=wait, detail=detail)
+                else:
+                    # Nothing that ready()/throttle_wait() reads is set, so the
+                    # next request goes upstream again instead of being answered
+                    # from a local window. The 6004 quota cap further down is
+                    # deliberately still applied: that is a spent window budget,
+                    # not a frequency limit, and it stays true until the reset
+                    # instant the upstream named. No window is computed here
+                    # either - the wait handed to the client is the upstream's
+                    # own hint, resolved when the failure is raised.
+                    log("account %s: 429 on '%s', passthrough: relayed, not parked"
+                        % (account.uid[:8], model))
+                    account.note_rate_observed(
+                        "HTTP 429 (model throttled, passthrough)", detail)
                 # 除了记冷却，还要把重置时刻交给后台探针：到点主动发一个最小
                 # 请求，把新一轮窗口的计时起点钉在那一刻（窗口按首次请求起算）。
                 #
@@ -14901,8 +14960,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
                     continue
-                log("account %s throttled on '%s' (429), retry in %ds"
-                    % (account.uid[:8], model, int(wait)))
+                if park_on_429:
+                    log("account %s throttled on '%s' (429), retry in %ds"
+                        % (account.uid[:8], model, int(wait)))
+                else:
+                    log("account %s throttled on '%s' (429), passthrough: relayed, "
+                        "not parked" % (account.uid[:8], model))
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
@@ -15145,8 +15208,17 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             exc.account_uid = last_uid
             raise exc
         if last_429 is not None:
-            exc = RateLimited(last_429, last_429_detail,
-                              wait=retry_after_seconds(model, realm))
+            if park_on_429:
+                wait = retry_after_seconds(model, realm)
+            else:
+                # Nothing is parked, so the shortest-cooldown query answers 0 and
+                # its fallback would hand the client a 60s window this gateway
+                # invented - the exact thing passthrough exists to stop. Relay the
+                # upstream's own advice; when it gave none, a floor that only
+                # prevents an immediate retry loop.
+                wait = (parse_retry_after_detail(last_429_detail)
+                        or PASSTHROUGH_RETRY_AFTER)
+            exc = RateLimited(last_429, last_429_detail, wait=wait)
             exc.account_uid = last_uid
             raise exc
         if last_403_detail:
@@ -20093,6 +20165,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_auto_switch_product(ACCOUNTS_DIR, raw)
             reply["auto_switch_product"] = raw
+        if "throttle_429" in payload:
+            # Only the two documented modes, rejected rather than coerced, so a
+            # typo cannot silently change throttling.
+            raw = payload.get("throttle_429")
+            if raw not in wb_settings.THROTTLE_429_MODES:
+                return self._error(
+                    400, "throttle_429 must be 'cooldown' or 'passthrough'",
+                    "invalid_request_error")
+            wb_settings.set_throttle_429(ACCOUNTS_DIR, raw)
+            reply["throttle_429"] = raw
         if "auto_switch_products" in payload:
             # 允许自动切换落在哪些身份上：必须是已知 product id 的列表。
             raw = payload.get("auto_switch_products")

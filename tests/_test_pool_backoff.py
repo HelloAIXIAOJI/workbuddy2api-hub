@@ -11,6 +11,7 @@ everything.
 No network: accounts are built from dicts and written to a temp directory.
 """
 import base64
+import io
 import json
 import os
 import sys
@@ -24,9 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TMP = tempfile.mkdtemp(prefix="wb-pool-backoff-")
 os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
 os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
+# 6004 的请求路径会写 limit-events.jsonl。指到临时目录，否则这些用例会把
+# 事件写进真实用量目录；此前的用例都不触发它，所以没有设过。
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_TMP, "usage")
+os.makedirs(os.environ["WB_PROXY_USAGE_DIR"], exist_ok=True)
 
 import wb_accounts as A
 import wb_proxy
+import wb_settings
 
 
 INTL_ISS = "https://www.workbuddy.ai/auth/realms/copilot"
@@ -492,6 +498,216 @@ class RetryRoundChargeTests(unittest.TestCase):
             self._drive(account, urlopen)
             self._drive(account, urlopen)
         self.assertEqual(account.fails, 2)
+
+
+class Throttle429ModeTests(unittest.TestCase):
+    """The panel's 429 handling switch: park the model, or relay and move on.
+
+    cooldown (the default) is the behaviour that predates the switch and must
+    stay exactly what it was. passthrough is the workbuddy2api behaviour: the
+    429 reaches the client and the account stays in rotation, so the next
+    request - an agent's next tool call, seconds later - goes upstream again
+    instead of being answered from a local cooldown the upstream never asked
+    for.
+    """
+
+    #: The intl frequency-limit body (code 14003) from the incident
+    #: environment: no reset clock, so nothing scopes it to the credential and
+    #: it becomes a window on one model.
+    SOFT_429 = ('{"code":14003,"msg":"too many requests",'
+                '"displayMsg":{"en":"Too many requests. Please retry later."}}')
+    #: A genuine quota cap (code 6004), the one 429 shape that carries a reset
+    #: clock and is therefore a statement about the model window budget.
+    CAP_429 = ('{"code":6004,"msg":"usage exceeds frequency limit, '
+               'your usage will reset at 2030-01-01 00:00:00 UTC+8."}')
+    #: An intl free cap model (see FREE_CAP_MODELS): the only scope the
+    #: persistent-disable path covers.
+    CAP_MODEL = "hy3"
+
+    def _settings_dir(self, mode):
+        directory = tempfile.mkdtemp(prefix="throttle-429-")
+        if mode is not None:
+            wb_settings.set_throttle_429(directory, mode)
+        return directory
+
+    def _drive(self, account, model, body, mode):
+        """Run the real open_upstream() into a stubbed 429; return the failure."""
+        error = urllib.error.HTTPError(
+            "https://upstream.invalid", 429, "rate limit", {},
+            io.BytesIO(body.encode("utf-8")))
+
+        class Pool(object):
+            accounts = [account]
+            affinity = type("Affinity", (), {
+                "unbind": lambda self, key: None,
+                "demote": lambda self, key, uid=None: None})()
+
+            def count_ready(self, realm, model=None):
+                return 1
+
+            def pick_for_session(self, realm, session_key=None, exclude=(),
+                                 model=None, page=None):
+                return None if account.uid in exclude else account
+
+            def list_public(self):
+                return []
+
+            def apply_remaining_weights(self, weights=None):
+                return weights or {}
+
+            def apply_daily_token_limit(self, *a, **k):
+                return 0
+
+            def apply_daily_credit_limit(self, *a, **k):
+                return 0
+
+            def apply_model_daily_token_limit(self, *a, **k):
+                return 0
+
+        old_pool, old_urlopen = wb_proxy.POOL, A.urlopen
+        wb_proxy.POOL = Pool()
+        A.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+        try:
+            with mock.patch.object(wb_proxy, "ACCOUNTS_DIR",
+                                   self._settings_dir(mode)):
+                with self.assertRaises(wb_proxy.RateLimited) as caught:
+                    wb_proxy.open_upstream(
+                        {"model": model,
+                         "messages": [{"role": "user", "content": "hi"}]},
+                        target_realm="intl")
+        finally:
+            wb_proxy.POOL, A.urlopen = old_pool, old_urlopen
+        return caught.exception
+
+    def test_the_switch_defaults_to_the_historical_cooldown(self):
+        """An install that never touched the setting keeps the old behaviour."""
+        directory = tempfile.mkdtemp(prefix="throttle-429-default-")
+        self.assertEqual(wb_settings.throttle_429(directory), "cooldown")
+        self.assertEqual(wb_settings.set_throttle_429(directory, "passthrough"),
+                         "passthrough")
+        self.assertEqual(wb_settings.throttle_429(directory), "passthrough")
+        self.assertEqual(wb_settings.set_throttle_429(directory, "cooldown"),
+                         "cooldown")
+        # A hand-edited value must never silently disable throttling.
+        with open(wb_settings.settings_path(directory), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"throttle_429": "off"}, fh)
+        self.assertEqual(wb_settings.throttle_429(directory), "cooldown")
+
+    def test_cooldown_mode_parks_the_model(self):
+        account = load_account("u-throttle-cooldown")
+        self._drive(account, "glm-5.3", self.SOFT_429, "cooldown")
+        self.assertEqual(account.unscoped_streak, 1)
+        self.assertFalse(account.ready(model="glm-5.3"))
+        self.assertTrue(account.public()["modelCooldowns"])
+
+    def test_passthrough_mode_keeps_the_model_in_rotation(self):
+        """The 2api behaviour: relay the 429, park nobody."""
+        account = load_account("u-throttle-passthrough")
+        self._drive(account, "glm-5.3", self.SOFT_429, "passthrough")
+        self.assertEqual(account.unscoped_streak, 0,
+                         "the unscoped model ladder must not advance")
+        self.assertEqual(account.soft_streak, 0,
+                         "the credential ladder must not advance")
+        self.assertEqual(account.throttle_wait(model="glm-5.3"), 0)
+        self.assertTrue(account.ready(model="glm-5.3"))
+        self.assertEqual(account.public()["modelCooldowns"], [])
+        # The observation stays visible on the account row; nothing that
+        # ready()/throttle_wait() reads is touched by it.
+        self.assertIn("429", account.public()["lastError"])
+
+    def test_passthrough_still_honours_a_genuine_quota_cap(self):
+        """6004 is quota exhaustion, not a frequency limit.
+
+        The switch governs the frequency windows. A model whose upstream quota
+        window is spent stays parked until the reset instant the upstream
+        named, in both modes - otherwise the gateway would hammer a window that
+        cannot serve anything until then.
+        """
+        account = load_account("u-throttle-cap")
+        self._drive(account, self.CAP_MODEL, self.CAP_429, "passthrough")
+        self.assertGreater(account.cap_until(self.CAP_MODEL), time.time())
+        self.assertFalse(account.ready(model=self.CAP_MODEL))
+
+    def test_passthrough_does_not_fabricate_a_sixty_second_retry(self):
+        """Nothing is parked, so a 60s Retry-After would be invented here.
+
+        retry_after_seconds() answers 60 when no account is cooling - correct in
+        cooldown mode, but in passthrough it would hand the client a window the
+        gateway itself decided not to impose.
+        """
+        account = load_account("u-throttle-retry-after")
+        exc = self._drive(account, "glm-5.3", self.SOFT_429, "passthrough")
+        self.assertLessEqual(exc.wait, wb_proxy.PASSTHROUGH_RETRY_AFTER)
+
+    def test_passthrough_relays_the_upstream_retry_hint(self):
+        account = load_account("u-throttle-retry-hint")
+        body = '{"code":14003,"msg":"too many requests; retry in 51s"}'
+        exc = self._drive(account, "glm-5.3", body, "passthrough")
+        self.assertEqual(exc.wait, 51)
+
+    def test_cooldown_mode_still_reports_the_cooldown(self):
+        account = load_account("u-throttle-retry-cooldown")
+        exc = self._drive(account, "glm-5.3", self.SOFT_429, "cooldown")
+        # The reported wait is the cooldown itself (int()-truncated from the
+        # remaining time), not the passthrough floor.
+        self.assertGreater(exc.wait, wb_proxy.PASSTHROUGH_RETRY_AFTER)
+        self.assertAlmostEqual(exc.wait, 60, delta=2)
+
+    def test_passthrough_does_not_advance_the_credential_ladder(self):
+        """A credential-scoped 429 must not buy the 600s -> 7200s ladder."""
+        account = load_account("u-throttle-account-level")
+        body = '{"message":"too many requests for this account"}'
+        self._drive(account, "glm-5.3", body, "passthrough")
+        self.assertEqual(account.soft_streak, 0)
+        self.assertEqual(account.throttle_wait(), 0)
+        self.assertTrue(account.ready(model="glm-5.3"))
+
+
+class Throttle429SettingsRouteTests(unittest.TestCase):
+    """The panel route must reject anything but the two documented modes.
+
+    Coercing an unknown value instead would let a typo or a wrong-typed field
+    silently change how every 429 is handled.
+    """
+
+    class _Route(object):
+        def __init__(self, payload):
+            self.payload = payload
+            self.code = None
+            self.body = None
+
+        def _payload_or_error(self):
+            return self.payload
+
+        def _error(self, code, message, err_type=None):
+            self.code, self.body = code, message
+            return code, message
+
+        def _json(self, code, obj):
+            self.code, self.body = code, obj
+            return code, obj
+
+    def _save(self, payload, directory):
+        route = self._Route(payload)
+        with mock.patch.object(wb_proxy, "ACCOUNTS_DIR", directory):
+            wb_proxy.Handler._handle_settings_save(route)
+        return route
+
+    def test_a_valid_mode_is_persisted_and_echoed(self):
+        directory = tempfile.mkdtemp(prefix="throttle-route-")
+        route = self._save({"throttle_429": "passthrough"}, directory)
+        self.assertEqual(route.code, 200)
+        self.assertEqual(route.body["throttle_429"], "passthrough")
+        self.assertEqual(wb_settings.throttle_429(directory), "passthrough")
+
+    def test_an_unknown_mode_is_rejected_without_writing(self):
+        directory = tempfile.mkdtemp(prefix="throttle-route-bad-")
+        for bad in ("off", "", None, True, 1, ["passthrough"], {"mode": "x"}):
+            route = self._save({"throttle_429": bad}, directory)
+            self.assertEqual(route.code, 400, repr(bad))
+        self.assertEqual(wb_settings.throttle_429(directory), "cooldown",
+                         "a rejected payload must not persist anything")
 
 
 if __name__ == "__main__":

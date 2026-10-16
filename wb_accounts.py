@@ -3513,6 +3513,19 @@ class Account(object):
                 self.restricted_until = now + max(1.0, wait)
         return self.restricted_until
 
+    def note_rate_observed(self, message, detail=None):
+        """Record an upstream 429 the gateway is NOT turning into a cooldown.
+
+        Passthrough mode relays the 429 to the client instead of parking the
+        account. Keeping the observation on the account row is what lets the
+        panel show that upstream is throttling while the row still reads as
+        usable; only last_error/last_error_detail are touched, so nothing that
+        ready() or throttle_wait() reads changes.
+        """
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            self.last_error_detail = str(detail)[:2000] if detail else ""
+
     def note_balance_cooled(self, message="insufficient credits"):
         """402 / out of credits: park until the next local 04:00.
 
